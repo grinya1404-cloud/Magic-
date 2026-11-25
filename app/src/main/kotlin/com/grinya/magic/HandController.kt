@@ -92,8 +92,8 @@ class HandController(
         }
         return -1
     }
-
-    @SuppressLint("ClickableViewAccessibility")
+    
+        @SuppressLint("ClickableViewAccessibility")
     inner class Touch : View.OnTouchListener {
 
         private var activeCard: CardModel? = null
@@ -111,8 +111,7 @@ class HandController(
                 MotionEvent.ACTION_DOWN -> {
                     activeView = v
                     activeCard = v.tag as? CardModel
-                    // ScrollView не должен отбирать жест посреди драга
-                    (v.parent as? ViewGroup)?.requestDisallowInterceptTouchEvent(true)
+                    // Перехват НЕ запрещаем: решим по направлению жеста
                     downRawX = event.rawX
                     downRawY = event.rawY
                     lastRawX = downRawX
@@ -128,25 +127,35 @@ class HandController(
                 }
 
                 MotionEvent.ACTION_MOVE -> {
-                    // Пошевелил — значит тянем, не описываем
                     infoRunnable?.let { handler.removeCallbacks(it) }
 
                     val card = activeCard
-                    if (!dragStarted && card != null &&
-                        (abs(event.rawX - downRawX) >= DRAG_THRESHOLD ||
-                         abs(event.rawY - downRawY) >= DRAG_THRESHOLD)
-                    ) startDrag()
+                    if (!dragStarted) {
+                        val dx = abs(event.rawX - downRawX)
+                        val dy = abs(event.rawY - downRawY)
+                        if (card != null && (dx >= DRAG_THRESHOLD || dy >= DRAG_THRESHOLD)) {
+                            if (dy >= dx) {
+                                // Вертикальный жест — вытягиваем карту
+                                (v.parent as? ViewGroup)
+                                    ?.requestDisallowInterceptTouchEvent(true)
+                                startDrag()
+                            } else {
+                                // Горизонтальный жест — это прокрутка руки.
+                                // Отдаём касание ScrollView
+                                return false
+                            }
+                        }
+                    }
 
                     if (dragStarted) {
-                        // Дельта-следование: призрак повторяет движение пальца,
-                        // привязка не расходится никогда
+                        // Дельта-следование: призрак повторяет движение пальца
                         val g = ghost ?: return true
                         g.x += event.rawX - lastRawX
                         g.y += event.rawY - lastRawY
                     }
                     lastRawX = event.rawX
                     lastRawY = event.rawY
-                    return true
+                    return dragStarted // до старта драга прокрутке ничего не мешает
                 }
 
                 MotionEvent.ACTION_UP -> {
@@ -163,7 +172,7 @@ class HandController(
                         }
                     }
                     cleanup()
-                    return true
+                    return dragStarted
                 }
 
                 MotionEvent.ACTION_CANCEL -> {
@@ -207,7 +216,6 @@ class HandController(
         }
 
         private fun cleanup() {
-            activeView?.let { (it.parent as? ViewGroup)?.requestDisallowInterceptTouchEvent(false) }
             activeCard = null
             activeView = null
             dragStarted = false
@@ -226,4 +234,6 @@ class HandController(
             return -1
         }
     }
+    
+    
 }

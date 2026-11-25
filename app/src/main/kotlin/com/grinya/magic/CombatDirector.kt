@@ -16,7 +16,7 @@ class CombatDirector(
     private val onEnemyHit: (Int) -> Unit,
     private val onHeal: (Boolean, Int) -> Unit, // вампиризм и прочее лечение
     private val isOver: () -> Boolean,
-    private val onCreatureDeath: () -> Unit
+    private val onCreatureDeath: (String) -> Unit
 ) {
     private val handler = Handler(Looper.getMainLooper())
 
@@ -116,10 +116,17 @@ class CombatDirector(
         var atk = if (hasToken(attacker.effect, "dynamic_attack"))
             powersOf(isPlayer)[attacker.element] ?: 0
         else attacker.attack
+        if (hasToken(attacker.effect, "dynamic_attack")) {
+            onLog("«${attacker.name}»: атака = сила ${attacker.element} → $atk")
+        }
         val pct = creaturesOf(isPlayer)
             .filter { it !== attacker && hasToken(it.effect, "aura_attack_pct") }
             .sumOf { values(it.effect, "aura_attack_pct").sum() }
-        if (pct > 0) atk = atk * (100 + pct) / 100
+        if (pct > 0) {
+            val before = atk
+            atk = atk * (100 + pct) / 100
+            onLog("Аура атаки: «${attacker.name}» $before +$pct% → $atk")
+        }
         return atk
     }
 
@@ -130,11 +137,19 @@ class CombatDirector(
         if (targetIsMage) {
             val pct = creaturesOf(defenderIsPlayer)
                 .sumOf { values(it.effect, "dmg_reduce_owner_pct").sum() }
-            if (pct > 0) d = (d * (100 - pct) / 100).coerceAtLeast(1)
+            if (pct > 0) {
+                val before = d
+                d = (d * (100 - pct) / 100).coerceAtLeast(1)
+                onLog("Защита: Ледяной страж — урон $before → $d")
+            }
         }
         val flat = creaturesOf(defenderIsPlayer)
             .sumOf { values(it.effect, "dmg_reduce_owner_flat").sum() }
-        if (flat > 0 && d > 1) d = (d - flat).coerceAtLeast(1)
+        if (flat > 0 && d > 1) {
+            val before = d
+            d = (d - flat).coerceAtLeast(1)
+            onLog("Защита: Эльф-защитник — урон $before → $d")
+        }
         return d
     }
 
@@ -205,8 +220,9 @@ class CombatDirector(
             return false
         }
         if (tryResurrect(index, card, amount)) return false
+        val diedName = card.name
         field.killCard(index) { v -> die(v) }
-        onCreatureDeath()
+        onCreatureDeath(diedName)
         return true
     }
 
@@ -221,8 +237,9 @@ class CombatDirector(
         val view = field.cardViewAt(index) ?: return
         val card = view.tag as? CardModel ?: return
         if (tryResurrect(index, card, 1)) return
+        val diedName = card.name
         field.killCard(index) { v -> die(v) }
-        onCreatureDeath()
+        onCreatureDeath(diedName)
     }
 
     // Феникс: при смерти, если сила Огня владельца больше порога — выживает
@@ -234,7 +251,7 @@ class CombatDirector(
                     card.health = dmg.coerceAtLeast(1)
                     val v = field.cardViewAt(index)
                     if (v != null) { factory.updateStatsText(v, card); flash(v) }
-                    onLog("«${card.name}» возрождается!")
+                    onLog("«${card.name}» возрождается! (сила ${p[1]} = $pw > ${p[2]})")
                     return true
                 }
             }

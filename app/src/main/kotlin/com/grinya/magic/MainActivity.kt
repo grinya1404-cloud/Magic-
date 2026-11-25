@@ -1,5 +1,9 @@
 package com.grinya.magic
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.graphics.Typeface
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -7,13 +11,14 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.ScrollView
 import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import kotlin.random.Random
-import androidx.appcompat.app.AlertDialog
 
 class MainActivity : AppCompatActivity() {
 
@@ -40,6 +45,9 @@ class MainActivity : AppCompatActivity() {
 
     private var playerJustPlayedCard: CardModel? = null
     private var aiJustPlayedCard: CardModel? = null
+
+    // Полный журнал игры — открывается кликом по строке лога
+    private val logHistory = StringBuilder()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -75,7 +83,7 @@ class MainActivity : AppCompatActivity() {
                 updateLifeUI(); checkGameEnd()
             },
             isOver = { gameOver },
-            onCreatureDeath = { abilityEngine.onCreatureDeath() }
+            onCreatureDeath = { diedName -> abilityEngine.onCreatureDeath(diedName) }
         )
 
         abilityEngine = AbilityEngine(
@@ -92,13 +100,12 @@ class MainActivity : AppCompatActivity() {
             },
             damageCreature = { slot, dmg -> combat.damageAt(slot, dmg) },
             healCreature = { slot, amt -> combat.healAt(slot, amt) },
-            killCreature = { slot -> combat.killAt(slot) }   // <-- вот это
+            killCreature = { slot -> combat.killAt(slot) }
         )
 
         elementPanel = ElementPanel(findViewById(R.id.leftResources), ELEMENTS, 20) { element ->
             elementPanel.highlightSelected(element)
             handController.selectElement(element)
-            log(if (playerTurn) "Ваш ход. Пакет: $element" else "Пакет: $element (ход противника)")
         }
 
         handController = HandController(
@@ -107,7 +114,7 @@ class MainActivity : AppCompatActivity() {
             findViewById(R.id.dragOverlay),
             field, factory,
             canDrag = { playerTurn && !gameOver },
-            onDropRequest = { card, view, slotIndex -> tryPlayCard(card, view, slotIndex) }, // <-- запятая
+            onDropRequest = { card, view, slotIndex -> tryPlayCard(card, view, slotIndex) },
             onCardInfo = { card -> showCardInfo(card) }
         )
 
@@ -118,6 +125,7 @@ class MainActivity : AppCompatActivity() {
 
         handController.setCards(handCards)
         setupSkipButton()
+        setupLogClick()
         updateLifeUI()
         log("Ваш ход")
     }
@@ -128,7 +136,8 @@ class MainActivity : AppCompatActivity() {
         if (!playerTurn || gameOver) return false
         if (card.type == "spell") return tryCastSpellOn(card, slotIndex)
 
-        if (!field.isFree(slotIndex)) return false
+        // Свои существа — только в свои слоты (0..4)
+        if (slotIndex > 4 || !field.isFree(slotIndex)) return false
 
         val available = elementPanel.get(card.element)
         if (available < card.cost) {
@@ -150,6 +159,12 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT,
             ViewGroup.LayoutParams.MATCH_PARENT
         )
+        // Со слота карту больше не таскаем; долгий тап — описание
+        view.setOnTouchListener(null)
+        view.setOnLongClickListener { showCardInfo(card); true }
+
+        // Срабатывание способностей «при входе»
+        abilityEngine.onEnter(slotIndex, true)
 
         playerJustPlayedCard = card
         log("Вы выложили «${card.name}»")
@@ -175,17 +190,23 @@ class MainActivity : AppCompatActivity() {
         else abilityEngine.castSpell(card, true)
         updateLifeUI()
         checkGameEnd()
+        // Заклинание завершает ход так же, как существо и «Пропустить»
+        playerJustPlayedCard = null
+        endPlayerTurn()
         return true
     }
 
     private fun endPlayerTurn() {
         playerTurn = false
         if (gameOver) return
+        abilityEngine.onTurnEnd(true, playerJustPlayedCard)
         combat.resolve(true, playerJustPlayedCard) {
             playerJustPlayedCard = null
-            elementPanel.regenAll()          // <-- сюда
+            elementPanel.regenAll()
+            log("Реген: +1 ко всем стихиям")
+            logPowers()
             if (!gameOver) {
-                log("Ход противника…")
+                log("—— Ход противника ——")
                 aiHandler.postDelayed({ aiTurn() }, 1200)
             }
         }
@@ -196,32 +217,110 @@ class MainActivity : AppCompatActivity() {
 
         val affordable = aiHand.filter { (aiPoints[it.element] ?: 0) >= it.cost }
         val freeSlots = (5..9).filter { field.isFree(it) }
+        val creatures = affordable.filter { it.type == "creature" }
+        val spells = affordable.filter { it.type == "spell" }
 
-        if (affordable.isEmpty() || freeSlots.isEmpty()) {
-            log("Противник пропустил ход")
-        } else {
-            val card = affordable[Random.nextInt(affordable.size)]
+        var played = false
+
+        // Существо — если есть куда и есть что; в одном случае из четырёх
+        // ИИ отдаёт ход заклинанию, чтобы не копить магию мёртвым грузом
+        val preferSpell = creatures.isEmpty() || freeSlots.isEmpty() ||
+        (spells.isNotEmpty() && Random.nextInt(4) == 0)
+
+        if (preferSpell && spells.isNotEmpty()) {
+            val card = spells[Random.nextInt(spells.size)]
+            if (aiCastSpell(card)) {
+                // Сила и карта списываются только после успешного каста
+                aiPoints[card.element] = (aiPoints[card.element] ?: 0) - card.cost
+                aiHand.remove(card)
+                played = true
+            }
+        }
+
+        if (!played && creatures.isNotEmpty() && freeSlots.isNotEmpty()) {
+            val card = creatures[Random.nextInt(creatures.size)]
             val slotIndex = freeSlots[Random.nextInt(freeSlots.size)]
 
             aiPoints[card.element] = (aiPoints[card.element] ?: 0) - card.cost
             aiHand.remove(card)
             aiJustPlayedCard = card
 
-            field.place(factory.createSlotCard(card), slotIndex)
+            val cardView = factory.createSlotCard(card)
+            cardView.setOnLongClickListener { showCardInfo(card); true }
+            field.place(cardView, slotIndex)
+
+            abilityEngine.onEnter(slotIndex, false)
+
             log("Противник выложил «${card.name}»")
+
+        } else if (!played) {
+            log("Противник пропустил ход")
         }
 
+        abilityEngine.onTurnEnd(false, aiJustPlayedCard)
         combat.resolve(false, aiJustPlayedCard) {
             aiJustPlayedCard = null
-            for (e in ELEMENTS) {            // <-- сюда
+            for (e in ELEMENTS) {
                 aiPoints[e] = (aiPoints[e] ?: 0) + 1
             }
+            log("Реген ИИ: +1 ко всем стихиям")
+            logPowers()
             if (!gameOver) {
                 playerTurn = true
-                log("Ваш ход")
+                log("—— Ваш ход ——")
             }
         }
+    }
 
+    // Каст заклинания ИИ. true — заклинание сработало, силу и карту можно списывать
+    private fun aiCastSpell(card: CardModel): Boolean {
+        val tokens = card.effect.split(";")
+        .map { it.trim().split(":") }
+        .filter { it.isNotEmpty() && it[0].isNotEmpty() }
+
+        // Заклинания, которым нужна своя цель
+        val targeted = tokens.any { it[0] in setOf(
+                "spell_dmg_enemy_creatures", "spell_dmg_enemy_creatures_dyn",
+                "spell_dmg_enemy_both_dyn", "spell_dmg_all_creatures",
+                "spell_dmg_equal_attack", "spell_kill_maxhp", "spell_meteor"
+        ) }
+        // Заклинания, которым нужны свои существа
+        val healOwn = tokens.any { it[0] == "spell_heal_owner_creatures" }
+        // Заклинания, которым нужны чужие существа (иначе эффект пустой)
+        val needsEnemies = targeted || tokens.any {
+            it[0] == "spell_hypnosis" || it[0] == "spell_dmg_enemy_creatures"
+        }
+
+        val enemyCreatures = (0..4).filter { field.cardAt(it) != null }
+        val ownCreatures = (5..9).filter { field.cardAt(it) != null }
+
+        if (needsEnemies && enemyCreatures.isEmpty()) return false
+
+        if (healOwn && ownCreatures.isNotEmpty()) {
+            val target = ownCreatures[Random.nextInt(ownCreatures.size)]
+            if (abilityEngine.castSpellTargeted(card, false, target)) {
+                log("Противник применяет «${card.name}»")
+                return true
+            }
+            return false
+        }
+
+        if (targeted) {
+            // Простой «умный» выбор: цель с наибольшей жизнью
+            val target = enemyCreatures.maxByOrNull { field.cardAt(it)?.health ?: 0 }
+            ?: return false
+            if (abilityEngine.castSpellTargeted(card, false, target)) {
+                log("Противник применяет «${card.name}»")
+                return true
+            }
+            return false
+        }
+
+        if (abilityEngine.castSpell(card, false)) {
+            log("Противник применяет «${card.name}»")
+            return true
+        }
+        return false
     }
 
     // ---------- Жизни ----------
@@ -289,8 +388,50 @@ class MainActivity : AppCompatActivity() {
         logPanel.addView(button)
     }
 
+    // Клик по строке лога — полное окно журнала
+    private fun setupLogClick() {
+        findViewById<TextView>(R.id.logLine1)?.setOnClickListener { showFullLog() }
+    }
+
+    private fun showFullLog() {
+        val scroll = ScrollView(this)
+        val text = TextView(this).apply {
+            textSize = 12f
+            typeface = Typeface.MONOSPACE
+            setPadding(24, 16, 24, 16)
+            text = logHistory.toString()
+        }
+        scroll.addView(text)
+
+        AlertDialog.Builder(this)
+        .setTitle("Журнал игры")
+        .setView(scroll)
+        .setPositiveButton("Ок", null)
+        .setNegativeButton("Скопировать") { _, _ ->
+            val cm = getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+            cm?.setPrimaryClip(ClipData.newPlainText("log", logHistory.toString()))
+        }
+        .show()
+    }
+
     private fun log(text: String) {
+        logHistory.append(text).append('\n')
         findViewById<TextView>(R.id.logLine1)?.text = text
+    }
+
+    private fun ru(element: String) = when (element) {
+        "Fire" -> "Огонь"; "Water" -> "Вода"; "Air" -> "Воздух"
+        "Earth" -> "Земля"; else -> "Смерть"
+    }
+
+    private fun powersLine(isPlayer: Boolean): String =
+    ELEMENTS.joinToString(", ") { e ->
+        val v = if (isPlayer) elementPanel.get(e) else (aiPoints[e] ?: 0)
+        "${ru(e)} $v"
+    }
+
+    private fun logPowers() {
+        log("Сила — игрок: ${powersLine(true)} | ИИ: ${powersLine(false)}")
     }
 
     private fun showCardInfo(card: CardModel) {
@@ -313,5 +454,4 @@ class MainActivity : AppCompatActivity() {
         .setPositiveButton("Ок", null)
         .show()
     }
-
 }
